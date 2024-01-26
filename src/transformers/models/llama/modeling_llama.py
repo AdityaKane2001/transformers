@@ -181,8 +181,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    cos = cos[position_ids].unsqueeze(1)  # [1, 1, pos_id_seq_len, dim] coz pos_ids has rank=2
+    sin = sin[position_ids].unsqueeze(1)  # [1, 1, pos_id_seq_len, dim] coz pos_ids has rank=2
+    # print(f"{cos.shape=}")
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -402,9 +403,9 @@ class SepEmb2LlamaAttention(nn.Module):
         
         # bsz, num_heads, q_len, kv_len = attn_weights.size()
         
-        image_attn_mask = torch.zeros((bsz, seq_len))
-        video_attn_mask = torch.zeros((bsz, seq_len))
-        text_attn_mask = torch.zeros((bsz, seq_len))
+        image_attn_mask = torch.zeros(bsz, seq_len)
+        video_attn_mask = torch.zeros(bsz, seq_len)
+        text_attn_mask = torch.zeros(bsz, seq_len)
         
         mask_map = dict(
             text=text_attn_mask,
@@ -421,9 +422,10 @@ class SepEmb2LlamaAttention(nn.Module):
             for chunk_idx in range(len(example_buffer)):
                 chunk_modality = list(example_buffer[chunk_idx].keys())[0]
                 chunk_tokens = list(example_buffer[chunk_idx].values())[0]
-                mask_map[chunk_modality][..., running_tok_idx : running_tok_idx + chunk_tokens] = 1
+                mask_map[chunk_modality][example_idx, running_tok_idx : running_tok_idx + chunk_tokens] = 1
                 running_tok_idx += chunk_tokens
-
+        
+        
         return image_attn_mask, video_attn_mask, text_attn_mask
        
     def _init_multimodal_rope(self):
@@ -559,27 +561,46 @@ class SepEmb2LlamaAttention(nn.Module):
         ## Places current to KV cache
         past_key_value = (key_states, value_states) if use_cache else None
         
-        ## Adds RoPE according to effective seq len
-        text_cos, text_sin = self.text_rotary_emb(value_states, seq_len=kv_seq_len)
-        image_cos, image_sin = self.image_rotary_emb(value_states, seq_len=kv_seq_len)
-        video_cos, video_sin = self.video_rotary_emb(value_states, seq_len=kv_seq_len)
-        
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        
-        print(f"Pre-rope {key_states.shape=}")
-        print(f"Pre-rope {query_states.shape=}")
-        
-        _, key_states = apply_rotary_pos_emb(torch.zeros_like(query_states), key_states, cos, sin, full_seq_pos_ids)
-        query_states, _ = apply_rotary_pos_emb(query_states, torch.zeros_like(key_states), cos, sin, position_ids)
-
-        print(f"Post-rope {key_states.shape=}")
-        print(f"Post-rope {query_states.shape=}")
-        
         image_mask, video_mask, text_mask = self._calculate_modality_indices(bsz, kv_seq_len)
+    
         
-        print(f"Video masked {key_states.shape=}")
-        print(f"{query_states.shape=}")
+        ## Adds RoPE according to effective seq len
         
+        # FIXME
+        # CAUTION: THIS WILL BREAK IF TRIED WITH BATCHED INFERENCE
+        
+        text_cos, text_sin = self.text_rotary_emb(value_states, 
+                                    seq_len=text_mask.sum().to(torch.int)) 
+        image_cos, image_sin = self.image_rotary_emb(value_states, 
+                                    seq_len=image_mask.sum().to(torch.int))
+        video_cos, video_sin = self.video_rotary_emb(value_states, 
+                                    seq_len=video_mask.sum().to(torch.int))
+        
+        final_cos = torch.ones((bsz, 1, kv_seq_len, text_cos.shape[-1]), 
+                                dtype=text_cos.dtype, device=text_cos.device)
+        final_sin = torch.ones((bsz, 1, kv_seq_len, text_sin.shape[-1]), 
+                                dtype=text_sin.dtype, device=text_sin.device)
+        
+        # FIXME
+        # CAUTION: THIS WILL BREAK IN BATCHED INFERENCE
+        # final_cos[:, :, image_mask[0] > 0, :] = image_cos.half()
+        # final_cos[:, :, video_mask[0] > 0, :] = video_cos.half()
+        # final_cos[:, :, text_mask[0] > 0, :] = text_cos.half()
+        
+        # final_sin[:, :, image_mask[0] > 0, :] = image_sin.half()
+        # final_sin[:, :, video_mask[0] > 0, :] = video_sin.half()
+        # final_sin[:, :, text_mask[0] > 0, :] = text_sin.half()
+        
+
+        
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        
+        _, key_states = apply_rotary_pos_emb(torch.zeros_like(query_states), key_states, final_cos, final_sin, full_seq_pos_ids)
+        query_states, _ = apply_rotary_pos_emb(query_states, torch.zeros_like(key_states), final_cos, final_sin, position_ids)
+        
+        # B, H, N, C
+
         ## Proceeds as normal
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
