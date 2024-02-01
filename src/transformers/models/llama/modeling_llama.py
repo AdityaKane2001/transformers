@@ -566,9 +566,11 @@ class SepEmb2LlamaAttention(nn.Module):
         
         ## Adds RoPE according to effective seq len
         
-        # FIXME
+        # FIXME ################################################################
         # CAUTION: THIS WILL BREAK IF TRIED WITH BATCHED INFERENCE
         
+        # text_cos, text_sin = self.text_rotary_emb(value_states, 
+        #                             seq_len=kv_seq_len) 
         text_cos, text_sin = self.text_rotary_emb(value_states, 
                                     seq_len=kv_seq_len) 
         image_cos, image_sin = self.image_rotary_emb(value_states, 
@@ -581,17 +583,23 @@ class SepEmb2LlamaAttention(nn.Module):
         final_sin = torch.ones((bsz, 1, kv_seq_len, text_sin.shape[-1]), 
                                 dtype=text_sin.dtype, device=text_sin.device)
         
-        # FIXME
-        # CAUTION: THIS WILL BREAK IN BATCHED INFERENCE
-        # final_cos[:, :, image_mask[0] > 0, :] = image_cos.half()
-        final_cos[:, :, video_mask[0] > 0, :] = video_cos.half()
-        final_cos[:, :, text_mask[0] > 0, :] = text_cos[:, :, text_mask[0] > 0, :].half()
         
-        # final_sin[:, :, image_mask[0] > 0, :] = image_sin.half()
-        final_sin[:, :, video_mask[0] > 0, :] = video_sin.half()
+        
+        # final_cos[:, :, text_mask[0] > 0, :] = text_cos.half()
+        # final_sin[:, :, text_mask[0] > 0, :] = text_sin.half()
+        
+        final_cos[:, :, text_mask[0] > 0, :] = text_cos[:, :, text_mask[0] > 0, :].half()
         final_sin[:, :, text_mask[0] > 0, :] = text_sin[:, :, text_mask[0] > 0, :].half()
         
-
+        if image_mask[0].sum() > 0.:
+            final_cos[:, :, image_mask[0] > 0, :] = image_cos.half()
+            final_sin[:, :, image_mask[0] > 0, :] = image_sin.half()
+        
+        if video_mask[0].sum() > 0.:
+            final_cos[:, :, video_mask[0] > 0, :] = video_cos.half()
+            final_sin[:, :, video_mask[0] > 0, :] = video_sin.half()        
+        
+        # end FIXME ############################################################
         
         # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
