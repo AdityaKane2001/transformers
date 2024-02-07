@@ -562,8 +562,6 @@ class SepEmb2LlamaAttention(nn.Module):
         past_key_value = (key_states, value_states) if use_cache else None
         
         image_mask, video_mask, text_mask = self._calculate_modality_indices(bsz, kv_seq_len)
-    
-        
         ## Adds RoPE according to effective seq len
         
         # FIXME ################################################################
