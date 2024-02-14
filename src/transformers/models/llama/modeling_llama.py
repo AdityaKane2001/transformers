@@ -36,6 +36,9 @@ from .configuration_llama import LlamaConfig
 
 logger = logging.get_logger(__name__)
 
+# FIXME :))
+print = logger.critical
+
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 
@@ -230,6 +233,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -368,11 +372,421 @@ class LlamaAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class LlamaDecoderLayer(nn.Module):
+
+
+class ModalityBuffer:
+    inputs_emb_modalities = None
+    num_text_tokens = 0
+    num_image_tokens = 0
+    num_video_tokens = 0
+    init_seq_len = 0
+    
+    @staticmethod
+    def calculate_modality_indices(bsz, seq_len):
+        
+        # bsz, num_heads, q_len, kv_len = attn_weights.size()
+        
+        image_attn_mask = torch.zeros(bsz, seq_len)
+        video_attn_mask = torch.zeros(bsz, seq_len)
+        text_attn_mask = torch.zeros(bsz, seq_len)
+        
+        mask_map = dict(
+            text=text_attn_mask,
+            image=image_attn_mask,
+            video=video_attn_mask
+        )
+        
+        modalities_buffer = ModalityBuffer.inputs_emb_modalities
+        # List[List[Dict['modality': num_tokens]]]
+        
+        for example_idx in range(len(modalities_buffer)):
+            example_buffer = modalities_buffer[example_idx]
+            running_tok_idx = 0
+            for chunk_idx in range(len(example_buffer)):
+                chunk_modality = list(example_buffer[chunk_idx].keys())[0]
+                chunk_tokens = list(example_buffer[chunk_idx].values())[0]
+                mask_map[chunk_modality][example_idx, running_tok_idx : running_tok_idx + chunk_tokens] = 1
+                running_tok_idx += chunk_tokens
+        
+        _num_img_tok = image_attn_mask.sum().item()
+        _num_vid_tok = video_attn_mask.sum().item()
+        _num_text_tok = text_attn_mask.sum().item()
+        
+        if ModalityBuffer.init_seq_len < seq_len:
+            ModalityBuffer.init_seq_len = seq_len
+        
+        if ModalityBuffer.num_text_tokens < _num_text_tok:
+            ModalityBuffer.num_text_tokens = _num_text_tok
+        
+        if ModalityBuffer.num_image_tokens < _num_img_tok:
+            ModalityBuffer.num_image_tokens = _num_img_tok
+        
+        if ModalityBuffer.num_video_tokens < _num_vid_tok:
+            ModalityBuffer.num_video_tokens = _num_vid_tok
+                
+        return image_attn_mask, video_attn_mask, text_attn_mask
+
+class DropOnlyAttnLlamaAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
     def __init__(self, config: LlamaConfig):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.pretraining_tp = config.pretraining_tp
+        self.max_position_embeddings = config.max_position_embeddings
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self._init_rope()
+
+    def _init_rope(self):
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def _calculate_modality_indices(self, bsz, seq_len):
+        return ModalityBuffer.calculate_modality_indices(bsz, seq_len)
+    
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        if self.pretraining_tp > 1:
+            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.pretraining_tp
+            query_slices = self.q_proj.weight.split((self.num_heads * self.head_dim) // self.pretraining_tp, dim=0)
+            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.pretraining_tp)]
+            query_states = torch.cat(query_states, dim=-1)
+
+            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.pretraining_tp)]
+            key_states = torch.cat(key_states, dim=-1)
+
+            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.pretraining_tp)]
+            value_states = torch.cat(value_states, dim=-1)
+
+        else:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+            
+            
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        
+        full_seq_pos_ids = torch.arange(0, kv_seq_len).unsqueeze(0)
+            
+        past_key_value = (key_states, value_states) if use_cache else None
+        
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        _, key_states = apply_rotary_pos_emb(torch.zeros_like(query_states), key_states, cos, sin, full_seq_pos_ids)
+        query_states, _ = apply_rotary_pos_emb(query_states, torch.zeros_like(key_states), cos, sin, position_ids)
+
+        
+        image_mask, _, text_mask = self._calculate_modality_indices(bsz, kv_seq_len)
+
+        
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        
+        retain_mask = text_mask # + video_mask + image_mask
+        retain_indices = torch.nonzero(retain_mask)[:, 1][None, :].to(key_states.device)
+        
+        # gather all K, V of retained tokens        
+        kv_gather_indices = retain_indices[:, None, :, None].expand(1, value_states.shape[1], -1, value_states.shape[-1])
+        key_states = torch.gather(key_states, index=kv_gather_indices, dim=-2)
+        value_states = torch.gather(value_states, index=kv_gather_indices, dim=-2)
+        
+                
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        ## FIXME disabling attention checks due to token dropping
+        # if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        #     raise ValueError(
+        #         f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+        #         f" {attn_weights.size()}"
+        #     )
+
+        if attention_mask is not None:
+            # if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            #     raise ValueError(
+            #         f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            #     )
+            
+            
+            mask_gather_indices = retain_indices[:, None, None, :].expand(-1, -1, attn_weights.shape[2], -1)
+            attention_mask = torch.gather(attention_mask, index=mask_gather_indices, dim=-1)
+            
+            attn_weights = attn_weights + attention_mask
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        if self.pretraining_tp > 1:
+            attn_output = attn_output.split(self.hidden_size // self.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.pretraining_tp, dim=1)
+            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.pretraining_tp)])
+        else:
+            attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+
+class DropTokensLlamaAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config: LlamaConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.pretraining_tp = config.pretraining_tp
+        self.max_position_embeddings = config.max_position_embeddings
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self._init_rope()
+
+    def _init_rope(self):
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def _calculate_modality_indices(self, bsz, seq_len):
+        return ModalityBuffer.calculate_modality_indices(bsz, seq_len)
+    
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        if self.pretraining_tp > 1:
+            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.pretraining_tp
+            query_slices = self.q_proj.weight.split((self.num_heads * self.head_dim) // self.pretraining_tp, dim=0)
+            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.pretraining_tp)]
+            query_states = torch.cat(query_states, dim=-1)
+
+            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.pretraining_tp)]
+            key_states = torch.cat(key_states, dim=-1)
+
+            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.pretraining_tp)]
+            value_states = torch.cat(value_states, dim=-1)
+
+        else:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+            
+            
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        
+        full_seq_pos_ids = torch.arange(0, kv_seq_len).unsqueeze(0)
+            
+        past_key_value = (key_states, value_states) if use_cache else None
+        
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        _, key_states = apply_rotary_pos_emb(torch.zeros_like(query_states), key_states, cos, sin, full_seq_pos_ids)
+        query_states, _ = apply_rotary_pos_emb(query_states, torch.zeros_like(key_states), cos, sin, position_ids)
+
+        
+        image_mask, _, text_mask = self._calculate_modality_indices(bsz, kv_seq_len)
+
+        
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        
+        retain_mask = text_mask # + video_mask + image_mask
+        retain_indices = torch.nonzero(retain_mask)[:, 1][None, :].to(key_states.device)
+        
+        # gather all K, V of retained tokens        
+        kv_gather_indices = retain_indices[:, None, :, None].expand(1, value_states.shape[1], -1, value_states.shape[-1])
+        key_states = torch.gather(key_states, index=kv_gather_indices, dim=-2)
+        value_states = torch.gather(value_states, index=kv_gather_indices, dim=-2)
+        
+                
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        ## FIXME disabling attention checks due to token dropping
+        # if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        #     raise ValueError(
+        #         f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+        #         f" {attn_weights.size()}"
+        #     )
+
+        if attention_mask is not None:
+            # if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            #     raise ValueError(
+            #         f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            #     )
+            
+            
+            mask_gather_indices = retain_indices[:, None, None, :].expand(-1, -1, attn_weights.shape[2], -1)
+            attention_mask = torch.gather(attention_mask, index=mask_gather_indices, dim=-1)
+            
+            attn_weights = attn_weights + attention_mask
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        if self.pretraining_tp > 1:
+            attn_output = attn_output.split(self.hidden_size // self.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.pretraining_tp, dim=1)
+            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.pretraining_tp)])
+        else:
+            attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+
+class LlamaDecoderLayer(nn.Module):
+    def __init__(self, config: LlamaConfig, drop: bool = False):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        
+        if config.drop_layer_type == "drop_only_attn":
+            _cls = DropOnlyAttnLlamaAttention
+        elif config.drop_layer.type == "drop_tokens":
+            _cls = DropTokensLlamaAttention 
+            # for this case, we drop the tokens in the fwd method of this class,
+            # but handle RPEs inside attention
+            
+        elif config.drop_layer_type == "merge_unmerge":
+            _cls = None
+            raise NotImplementedError("")
+        else:
+            logger.critical(f"[LlamaDecoderLayer.__init__] Received {config.drop_layer_type=} "
+                        f"which is not yet supported, falling back to self attn")
+            _cls = LlamaAttention 
+        
+        if drop: # if drop is not set, then ignore all of the above
+            self.self_attn = _cls(config)
+        else:
+            self.self_attn = LlamaAttention(config)
+        
+        self.drop = drop
+        self.drop_layer_type = config.drop_layer_type
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -399,7 +813,32 @@ class LlamaDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
+        # hidden_states during first pass: [1, q_len, dim], q_len > 1
+        # hidden_states during other passes: [1, 1, dim]  
+        
+        bsz, q_len, dim = hidden_states.shape
+                
+        if q_len == 1:
+            # if single token, then pruning is already done
+            pass
+        else:
+            # here this layer can get unpruned or pruned tokens, we need to detect
+            # the correct case and act accordingly
+            if ModalityBuffer.init_seq_len > q_len:
+                # already pruned in a past layer
+                pass
+            else:
+                # perform pruning here
+                _, _, text_mask = self._calculate_modality_indices(bsz, q_len)
+                retain_mask = text_mask # + video_mask + image_mask
+                retain_indices = torch.nonzero(retain_mask)[:, 1][None, :].to(hidden_states.device)
+                
+                # gather all K, V of retained tokens        
+                q_gather_indices = retain_indices[:, :, None].expand(1, -1, dim)
+                hidden_states = torch.gather(hidden_states, index=q_gather_indices, dim=-2)    
 
+        
+        
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -554,11 +993,15 @@ class LlamaModel(LlamaPreTrainedModel):
 
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
+        
+        self.drop_at = config.drop_at
+        self.drop_layer_type = config.drop_layer_type
+                
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([LlamaDecoderLayer(config, drop=idx>=self.drop_at) for idx in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
