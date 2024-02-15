@@ -375,11 +375,132 @@ class LlamaAttention(nn.Module):
 
 
 class ModalityBuffer:
+    
+    # WARNING
+    # Here "current" and 
+    
     inputs_emb_modalities = None
-    num_text_tokens = 0
-    num_image_tokens = 0
-    num_video_tokens = 0
+    curr_seq_len = 0
+    curr_text_tokens = 0
+    curr_image_tokens = 0
+    curr_video_tokens = 0
     init_seq_len = 0
+    init_text_tokens = None
+    init_image_tokens = None
+    init_video_tokens = None
+    
+    
+    @staticmethod
+    def get_current_unmodified_seq_len():
+        unmod_seq_len = 0
+        
+        if ModalityBuffer.curr_text_tokens != 0:
+            unmod_seq_len += ModalityBuffer.curr_text_tokens
+        else:
+            unmod_seq_len += ModalityBuffer.init_text_tokens
+        
+        if ModalityBuffer.curr_image_tokens != 0:
+            unmod_seq_len += ModalityBuffer.curr_image_tokens
+        else:
+            unmod_seq_len += ModalityBuffer.init_image_tokens
+            
+        if ModalityBuffer.curr_video_tokens != 0:
+            unmod_seq_len += ModalityBuffer.curr_video_tokens
+        else:
+            unmod_seq_len += ModalityBuffer.init_video_tokens
+        
+        return unmod_seq_len
+    
+    @staticmethod
+    def log_state():
+        logger.critical(f"{ModalityBuffer.inputs_emb_modalities=}")
+        logger.critical(f"{ModalityBuffer.curr_seq_len=}")
+        logger.critical(f"{ModalityBuffer.curr_text_tokens=}")
+        logger.critical(f"{ModalityBuffer.curr_image_tokens=}")
+        logger.critical(f"{ModalityBuffer.curr_video_tokens=}")
+        logger.critical(f"{ModalityBuffer.init_seq_len=}")
+        logger.critical(f"{ModalityBuffer.init_text_tokens=}")
+        logger.critical(f"{ModalityBuffer.init_image_tokens=}")
+        logger.critical(f"{ModalityBuffer.init_video_tokens=}")
+        
+    
+    @staticmethod
+    def calculate_modality_indices(bsz):
+        # image_attn_mask = torch.zeros(bsz, 0)
+        # video_attn_mask = torch.zeros(bsz, 0)
+        # text_attn_mask = torch.zeros(bsz, 0)
+        
+        mask_map = dict(
+            text=[torch.zeros((1,0)) for _ in range(bsz)],
+            image=[torch.zeros((1,0)) for _ in range(bsz)],
+            video=[torch.zeros((1,0)) for _ in range(bsz)]
+        )
+
+        modalities_buffer = ModalityBuffer.inputs_emb_modalities
+        # List[List[Dict['modality': num_tokens]]]
+        
+        for example_idx in range(len(modalities_buffer)):
+            example_buffer = modalities_buffer[example_idx]
+            running_tok_idx = 0
+            for chunk_idx in range(len(example_buffer)):
+                chunk_modality = list(example_buffer[chunk_idx].keys())[0]
+                chunk_tokens = list(example_buffer[chunk_idx].values())[0]
+                correct_modality_values = torch.ones((bsz, chunk_tokens))
+                other_modality_values = torch.zeros((bsz, chunk_tokens))
+                
+                mask_map[chunk_modality][example_idx].append(correct_modality_values)
+                for k in mask_map.keys():
+                    if k != chunk_modality:
+                        mask_map[k][example_idx].append(other_modality_values)
+                
+                # mask_map[chunk_modality][example_idx, running_tok_idx : running_tok_idx + chunk_tokens] = 1
+                running_tok_idx += chunk_tokens
+            mask_map["image"][example_idx] = torch.concat(mask_map["image"][example_idx], dim=-1)  
+            mask_map["video"][example_idx] = torch.concat(mask_map["video"][example_idx], dim=-1)  
+            mask_map["text"][example_idx] = torch.concat(mask_map["text"][example_idx], dim=-1)  
+        
+        image_attn_mask = torch.concat(mask_map["image"], dim=0)
+        video_attn_mask = torch.concat(mask_map["video"], dim=0)
+        text_attn_mask = torch.concat(mask_map["text"], dim=0)
+        
+        _num_img_tok = int(image_attn_mask.sum().item())
+        _num_vid_tok = int(video_attn_mask.sum().item())
+        _num_text_tok = int(text_attn_mask.sum().item())
+        
+        # initialize number of text, image and video tokens
+        if ModalityBuffer.init_text_tokens is None:
+            ModalityBuffer.init_text_tokens = _num_text_tok
+            ModalityBuffer.init_seq_len += _num_text_tok
+        
+        if ModalityBuffer.init_video_tokens is None:
+            ModalityBuffer.init_video_tokens = _num_vid_tok
+            ModalityBuffer.init_seq_len += _num_vid_tok
+        
+        if ModalityBuffer.init_image_tokens is None:
+            ModalityBuffer.init_image_tokens = _num_img_tok
+            ModalityBuffer.init_seq_len += _num_img_tok
+        
+        # Update current buffer state
+        _update_flag = False
+        if ModalityBuffer.curr_text_tokens != _num_text_tok:
+            ModalityBuffer.curr_text_tokens = _num_text_tok
+            _update_flag = True
+        
+        if ModalityBuffer.curr_image_tokens != _num_img_tok:
+            ModalityBuffer.curr_image_tokens = _num_img_tok
+            _update_flag = True
+        
+        if ModalityBuffer.curr_video_tokens != _num_vid_tok:
+            ModalityBuffer.curr_video_tokens = _num_vid_tok
+            _update_flag = True
+        
+        if _update_flag:
+            ModalityBuffer.curr_seq_len = ModalityBuffer.curr_text_tokens + \
+                ModalityBuffer.curr_image_tokens + \
+                ModalityBuffer.curr_video_tokens
+                
+        return image_attn_mask, video_attn_mask, text_attn_mask
+
     
     @staticmethod
     def calculate_modality_indices(bsz, seq_len):
@@ -408,21 +529,41 @@ class ModalityBuffer:
                 mask_map[chunk_modality][example_idx, running_tok_idx : running_tok_idx + chunk_tokens] = 1
                 running_tok_idx += chunk_tokens
         
-        _num_img_tok = image_attn_mask.sum().item()
-        _num_vid_tok = video_attn_mask.sum().item()
-        _num_text_tok = text_attn_mask.sum().item()
+        _num_img_tok = int(image_attn_mask.sum().item())
+        _num_vid_tok = int(video_attn_mask.sum().item())
+        _num_text_tok = int(text_attn_mask.sum().item())
         
-        if ModalityBuffer.init_seq_len < seq_len:
-            ModalityBuffer.init_seq_len = seq_len
+        # initialize number of text, image and video tokens
+        if ModalityBuffer.init_text_tokens is None:
+            ModalityBuffer.init_text_tokens = _num_text_tok
+            ModalityBuffer.init_seq_len += _num_text_tok
         
-        if ModalityBuffer.num_text_tokens < _num_text_tok:
-            ModalityBuffer.num_text_tokens = _num_text_tok
+        if ModalityBuffer.init_video_tokens is None:
+            ModalityBuffer.init_video_tokens = _num_vid_tok
+            ModalityBuffer.init_seq_len += _num_vid_tok
         
-        if ModalityBuffer.num_image_tokens < _num_img_tok:
-            ModalityBuffer.num_image_tokens = _num_img_tok
+        if ModalityBuffer.init_image_tokens is None:
+            ModalityBuffer.init_image_tokens = _num_img_tok
+            ModalityBuffer.init_seq_len += _num_img_tok
         
-        if ModalityBuffer.num_video_tokens < _num_vid_tok:
-            ModalityBuffer.num_video_tokens = _num_vid_tok
+        # Update current buffer state
+        _update_flag = False
+        if ModalityBuffer.curr_text_tokens != _num_text_tok:
+            ModalityBuffer.curr_text_tokens = _num_text_tok
+            _update_flag = True
+        
+        if ModalityBuffer.curr_image_tokens != _num_img_tok:
+            ModalityBuffer.curr_image_tokens = _num_img_tok
+            _update_flag = True
+        
+        if ModalityBuffer.curr_video_tokens != _num_vid_tok:
+            ModalityBuffer.curr_video_tokens = _num_vid_tok
+            _update_flag = True
+        
+        if _update_flag:
+            ModalityBuffer.curr_seq_len = ModalityBuffer.curr_text_tokens + \
+                ModalityBuffer.curr_image_tokens + \
+                ModalityBuffer.curr_video_tokens
                 
         return image_attn_mask, video_attn_mask, text_attn_mask
 
@@ -676,6 +817,7 @@ class DropTokensLlamaAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        # this has pruned sequence
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
@@ -686,31 +828,52 @@ class DropTokensLlamaAttention(nn.Module):
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
         
-        full_seq_pos_ids = torch.arange(0, kv_seq_len).unsqueeze(0)
-            
+        ModalityBuffer.log_state()
+        
+        full_seq_len = ModalityBuffer.get_current_unmodified_seq_len()
+        full_seq_pos_ids = torch.arange(0, full_seq_len).unsqueeze(0).to(key_states.device)
+        
         past_key_value = (key_states, value_states) if use_cache else None
         
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-
-        _, key_states = apply_rotary_pos_emb(torch.zeros_like(query_states), key_states, cos, sin, full_seq_pos_ids)
+        cos, sin = self.rotary_emb(value_states, seq_len=full_seq_len)
+        # cos, sin have the shape [1, 1, seq_len, dim]
+        
+        _, _, text_mask = self._calculate_modality_indices(bsz, full_seq_len)
+        retain_mask = text_mask # + video_mask + image_mask
+        retain_indices = torch.nonzero(retain_mask)[:, 1][None, :].to(key_states.device)
+        # retain_indices: [1, full_seq_len]
+        
+        
+        # cos_sin_gather_indices = retain_indices[None, :, :, None].expand(1, 1, -1, cos.shape[-1])
+        # cos = torch.gather(cos, dim=-2, index=cos_sin_gather_indices)
+        # sin = torch.gather(sin, dim=-2, index=cos_sin_gather_indices)
+        
+        pruned_seq_pos_ids = torch.gather(full_seq_pos_ids, dim=-1, index=retain_indices)
+        
+        if q_len > 1:
+            position_ids = torch.gather(position_ids, dim=-1, index=retain_indices)
+        
+        
+        _, key_states = apply_rotary_pos_emb(torch.zeros_like(query_states), key_states, cos, sin, pruned_seq_pos_ids)
         query_states, _ = apply_rotary_pos_emb(query_states, torch.zeros_like(key_states), cos, sin, position_ids)
-
-        
-        image_mask, _, text_mask = self._calculate_modality_indices(bsz, kv_seq_len)
-
-        
+    
+        logger.critical(f"{cos.shape=}")
+        logger.critical(f"{sin.shape=}")
+        logger.critical(f"{pruned_seq_pos_ids.shape=}")
+        logger.critical(f"{position_ids.shape=}")
+        logger.critical(f"{position_ids=}")
+        logger.critical(f"{query_states.shape=}")
+        logger.critical(f"{key_states.shape=}")
+    
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         
         
-        retain_mask = text_mask # + video_mask + image_mask
-        retain_indices = torch.nonzero(retain_mask)[:, 1][None, :].to(key_states.device)
-        
         # gather all K, V of retained tokens        
-        kv_gather_indices = retain_indices[:, None, :, None].expand(1, value_states.shape[1], -1, value_states.shape[-1])
-        key_states = torch.gather(key_states, index=kv_gather_indices, dim=-2)
-        value_states = torch.gather(value_states, index=kv_gather_indices, dim=-2)
+        # kv_gather_indices = retain_indices[:, None, :, None].expand(1, value_states.shape[1], -1, value_states.shape[-1])
+        # key_states = torch.gather(key_states, index=kv_gather_indices, dim=-2)
+        # value_states = torch.gather(value_states, index=kv_gather_indices, dim=-2)
         
                 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -745,7 +908,7 @@ class DropTokensLlamaAttention(nn.Module):
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, -1, self.hidden_size)
 
         if self.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.pretraining_tp, dim=2)
@@ -767,7 +930,7 @@ class LlamaDecoderLayer(nn.Module):
         
         if config.drop_layer_type == "drop_only_attn":
             _cls = DropOnlyAttnLlamaAttention
-        elif config.drop_layer.type == "drop_tokens":
+        elif config.drop_layer_type == "drop_tokens":
             _cls = DropTokensLlamaAttention 
             # for this case, we drop the tokens in the fwd method of this class,
             # but handle RPEs inside attention
@@ -817,25 +980,27 @@ class LlamaDecoderLayer(nn.Module):
         # hidden_states during other passes: [1, 1, dim]  
         
         bsz, q_len, dim = hidden_states.shape
-                
-        if q_len == 1:
-            # if single token, then pruning is already done
-            pass
-        else:
-            # here this layer can get unpruned or pruned tokens, we need to detect
-            # the correct case and act accordingly
-            if ModalityBuffer.init_seq_len > q_len:
-                # already pruned in a past layer
+        
+        if self.drop:
+            
+            if q_len == 1:
+                # if single token, then pruning is already done
                 pass
             else:
-                # perform pruning here
-                _, _, text_mask = self._calculate_modality_indices(bsz, q_len)
-                retain_mask = text_mask # + video_mask + image_mask
-                retain_indices = torch.nonzero(retain_mask)[:, 1][None, :].to(hidden_states.device)
-                
-                # gather all K, V of retained tokens        
-                q_gather_indices = retain_indices[:, :, None].expand(1, -1, dim)
-                hidden_states = torch.gather(hidden_states, index=q_gather_indices, dim=-2)    
+                # here this layer can get unpruned or pruned tokens, we need to detect
+                # the correct case and act accordingly
+                if ModalityBuffer.init_seq_len > q_len:
+                    # already pruned in a past layer
+                    pass
+                else:
+                    # perform pruning here
+                    _, _, text_mask = ModalityBuffer.calculate_modality_indices(bsz, q_len)
+                    retain_mask = text_mask # + video_mask + image_mask
+                    retain_indices = torch.nonzero(retain_mask)[:, 1][None, :].to(hidden_states.device)
+                    
+                    # gather all K, V of retained tokens        
+                    q_gather_indices = retain_indices[:, :, None].expand(1, -1, dim)
+                    hidden_states = torch.gather(hidden_states, index=q_gather_indices, dim=-2)    
 
         
         
@@ -1111,6 +1276,7 @@ class LlamaModel(LlamaPreTrainedModel):
         next_decoder_cache = () if use_cache else None
 
         for idx, decoder_layer in enumerate(self.layers):
+            logger.critical(f"####### Layer {idx}")
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
