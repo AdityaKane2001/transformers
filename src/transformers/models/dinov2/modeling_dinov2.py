@@ -578,6 +578,9 @@ DINOV2_INPUTS_DOCSTRING = r"""
     DINOV2_START_DOCSTRING,
 )
 class Dinov2Model(Dinov2PreTrainedModel):
+    
+    _no_split_modules = ["Dinov2Layer"]
+    
     def __init__(self, config: Dinov2Config):
         super().__init__(config)
         self.config = config
